@@ -152,19 +152,9 @@ Whenever I (or you) make a change to the app:
   plain web server/static file host (`"provider": "generic"` with a URL) — let me
   know if you'd prefer that route and I'll reconfigure it.
 
-## Known limitation (minor, cosmetic)
+## Fully offline-capable
 
-The app still loads its fonts (Google Fonts) and the Excel export library (SheetJS)
-from the internet on startup — same as the HTML version did. This means:
-- The app needs an internet connection the first time it loads visuals/fonts and
-  whenever you use the Excel export buttons.
-- Everything else (logging trades, editing positions, the dashboard, backups) works
-  fully offline.
-
-If you want the app to be 100% offline-capable later, this can be fixed by
-downloading those two libraries once and bundling them into the `renderer` folder
-instead of loading them from a CDN — a small follow-up task, not required to use
-the app today.
+TradeVault now runs fully offline. Fonts and the SheetJS Excel export library are bundled locally with the application, eliminating the need for an internet connection during normal use.
 
 ## Project structure
 
