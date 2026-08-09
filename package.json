@@ -1,0 +1,53 @@
+{
+  "name": "tradevault",
+  "version": "1.1.0",
+  "description": "TradeVault - Journal. Analyze. Improve.",
+  "main": "main.js",
+  "author": "Ashish Labs",
+  "license": "ISC",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win",
+    "publish": "electron-builder --win --publish always",
+    "rebuild": "electron-rebuild -f -w better-sqlite3"
+  },
+  "devDependencies": {
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3",
+    "@electron/rebuild": "^3.6.0"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.1.2",
+    "electron-updater": "^6.2.1"
+  },
+  "build": {
+    "appId": "com.aks.tradevault",
+    "productName": "TradeVault",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**/*",
+      "build/icon.ico"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "akshukla-ai",
+      "repo": "tradevault"
+    }
+  }
+}
