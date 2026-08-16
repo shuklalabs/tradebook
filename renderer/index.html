@@ -210,9 +210,9 @@ const TABS = [
 ];
 // Default setup list, used to seed state.setups on first load and to migrate old free-text tags.
 // The live, editable list is state.setups (managed in Configuration, persisted separately).
-const DEFAULT_SETUPS = ['EMA Pullback', 'Volume Shock', 'HRP Daily', 'Base & Base', 'Flag', 'HRP Weekly', 'VCP', 'Pennant', 'C & H', 'H & S', 'Triangle', 'ABC Pattern', 'Wedges', 'Double Top', 'Double Bottom'];
+const DEFAULT_SETUPS = ['MCBC', 'EMAPB', 'MAZOR', 'V-C-P', 'C-&-H', 'H-&-S', 'HTFLAG', 'PENNANT', 'TRIANGLE', 'DARVAS-BOX'];
 // Default strategy list, used to seed state.strategies on first load. Live, editable list managed in Configuration.
-const DEFAULT_STRATEGIES = ['Intra Momnt.', 'Intra Contn.', 'Swing Momnt.', 'Swing Contn.', 'Posit Momnt.', 'Posit Contn.', 'Intra Revsl.', 'Swing Revsl.', 'Posit Revsl.'];
+const DEFAULT_STRATEGIES = ['SCALPING', 'INTRADAY', 'MOMENTUM', 'BREAKOUT', 'REVERSAL', 'SWINGTRADE'];
 // One-time cleanup map: old free-text variants -> canonical name, used to migrate previously logged trades.
 const SETUP_ALIASES = {
   'ema pullback': 'EMA Pullback', 'volume shockers': 'Volume Shockers', 'hrp daily': 'HRP Daily',
