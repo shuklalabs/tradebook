@@ -597,6 +597,11 @@ async function performResetAll(){
   state.lastUpdated = null;
   state.selectedStrategy = 'ALL';
   filters = { setup: 'ALL', side: 'ALL', q: '', openQ: '' };
+  // Must clear these BEFORE rebuilding, since buildInitialLedger() → capitalAsOf() →
+  // earliestStartingCapital() reads state.financialYears directly. Leaving the old FY list in
+  // place here would make it pull forward the old starting capital instead of the fresh 0 above.
+  state.financialYears = [];
+  state.capitalTransactions = [];
   const built = buildInitialLedger(); // rebuilds a single fresh current-FY, since state.trades is now empty
   state.financialYears = built.financialYears;
   state.capitalTransactions = built.capitalTransactions;
