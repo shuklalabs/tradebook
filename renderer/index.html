@@ -200,7 +200,8 @@ if(!window.electronAPI){
 // ---------------------------------------------------------------------------------------------
 let state = { startingCapital: 0, riskPct: 1, wcs: 20, trades: [], openTrades: [], sizingRows: [], setups: [], strategies: [],
   posIdCounters: {}, tab: 'dashboard', selectedFY: null, selectedStrategy: 'ALL', lastUpdated: null, theme: 'dark',
-  financialYears: [], capitalTransactions: [], playbooks: [], cmpLastUpdated: null };
+  financialYears: [], capitalTransactions: [], playbooks: [], cmpLastUpdated: null,
+  chargeRates: { EI:0.10, ED:0.25, EF:0.15, EO:0.40, CF:0.10, CO:0.35 }, dpCharge: 15.34, lastBackupAt: null };
 let filters = { setup: 'ALL', side: 'ALL', q: '', openQ: '' };
 let charts = {};
 const TABS = [
@@ -237,6 +238,29 @@ function tagOptions(list, currentValue, placeholder){
 }
 function setupOptions(currentValue){ return tagOptions(state.setups, currentValue, '— Select Setup —'); }
 function strategyOptions(currentValue){ return tagOptions(state.strategies, currentValue, '— Select Strategy —'); }
+// Trade Type (TT) — fixed list (not user-editable like Strategy/Setup), used to pick which Charges & Tax
+// rate applies to a trade. Kept as {code, label} pairs since the table column shows just the short code.
+const TRADE_TYPES = [
+  {code:'EI', label:'Equity Intraday'}, {code:'ED', label:'Equity Delivery'},
+  {code:'EF', label:'Equity Future'}, {code:'EO', label:'Equity Option'},
+  {code:'CF', label:'Commodity Future'}, {code:'CO', label:'Commodity Option'}
+];
+function tradeTypeLabel(code){ const m = TRADE_TYPES.find(x=>x.code===code); return m ? m.label : code; }
+function tradeTypeOptions(currentValue){
+  return '<option value="">— Select Trade Type —</option>' + TRADE_TYPES.map(x=>
+    `<option value="${x.code}" ${currentValue===x.code?'selected':''}>${x.code} — ${x.label}</option>`).join('');
+}
+// Default Charges & Tax rates — a rough approximation of Zerodha's published all-in round-trip
+// cost (brokerage + STT + exchange transaction charges + GST + SEBI charges + stamp duty) as a %
+// of turnover, current as of 2026. These are estimates, not exact — Zerodha's brokerage has a flat-fee
+// component (₹20 or 0.03%, whichever is lower) so the true % is higher on small trades and lower on
+// large ones; users should fine-tune these against their own contract notes.
+const DEFAULT_CHARGE_RATES = { EI:0.10, ED:0.25, EF:0.15, EO:0.40, CF:0.10, CO:0.35 };
+// DP (Depository Participant) charge — a flat ₹ fee (not %) charged once per scrip whenever shares
+// are sold out of demat, regardless of quantity. Only ever applies to Equity Delivery (ED) sells —
+// intraday and F&O never touch demat holdings, so it's skipped for every other Trade Type.
+// ₹15.34 = Zerodha's published figure (₹3.5 CDSL + ₹9.5 Zerodha fee + ₹2.34 GST), as of 2026.
+const DEFAULT_DP_CHARGE = 15.34;
 
 function uid(){ return 't_' + Date.now().toString(36) + Math.random().toString(36).slice(2,7); }
 function fmtMoney(n){ if(n==null||isNaN(n)) return '—'; return (n<0?'-':'') + Math.abs(Math.round(n)).toLocaleString('en-IN'); }
@@ -395,14 +419,17 @@ function fmtHold(days){ return days==null ? 'Open' : (days+'d'); }
 
 function computeClosed(t){
   const entryValue = t.entryPrice*t.qty, exitValue = t.exitPrice*t.qty;
-  const pnl = t.side==='SHORT' ? (t.entryPrice-t.exitPrice)*t.qty : (t.exitPrice-t.entryPrice)*t.qty;
+  const grossPnl = t.side==='SHORT' ? (t.entryPrice-t.exitPrice)*t.qty : (t.exitPrice-t.entryPrice)*t.qty;
+  const charge = calcCharge(entryValue, exitValue, t.tradeType);
+  const pnl = grossPnl - charge; // every downstream consumer (Dashboard, Capital Ledger, Excel export,
+  // R-Multiple, P/L%) reads this `pnl` field, so charges flow through everywhere from this one spot.
   const pctReturn = entryValue ? pnl/entryValue : null;
   const initRisk = (t.initSL!=null && t.initSL!=='') ? Math.abs(t.entryPrice-t.initSL)*t.qty : null;
   const initRiskPct = (t.initSL!=null && t.initSL!=='' && t.entryPrice) ? Math.abs(t.entryPrice-t.initSL)/t.entryPrice : null;
   const rrr = (initRisk && initRisk>0) ? pnl/initRisk : null;
   const holdDays = holdingDays(t.entry, t.exit);
   const fy = getFY(t.exit);
-  return {...t, entryValue, exitValue, pnl, pctReturn, initRisk, initRiskPct, rrr, holdDays, fy};
+  return {...t, entryValue, exitValue, grossPnl, charge, pnl, pctReturn, initRisk, initRiskPct, rrr, holdDays, fy};
 }
 function computeOpen(t){
   const capital = t.entryPrice*t.qty, cmp = t.cmp!=null ? t.cmp : t.entryPrice;
@@ -440,7 +467,7 @@ function stampPositionPosPct(t){
 }
 // Adds a new lot to an existing open trade for the same symbol, or creates a fresh one if none exists.
 // Returns { merged, position } — merged=true means it was folded into an existing position (no duplicate created).
-function mergeOrCreateOpenPosition({symbol, side, date, price, qty, initSL, trailedSL, cmp, strategy, setup}){
+function mergeOrCreateOpenPosition({symbol, side, date, price, qty, initSL, trailedSL, cmp, strategy, setup, tradeType}){
   const existing = state.openTrades.find(x=>x.symbol.toUpperCase()===symbol.toUpperCase());
   if(existing){
     migrateLegacyLots(existing);
@@ -450,7 +477,7 @@ function mergeOrCreateOpenPosition({symbol, side, date, price, qty, initSL, trai
     return { merged:true, position: existing };
   }
   const position = { id: uid(), posId: nextPosId(date), symbol, side, entry: date, entryPrice: price, qty,
-    initSL: initSL??null, trailedSL: trailedSL??null, cmp: cmp??price, strategy: strategy??null, setup: setup??null,
+    initSL: initSL??null, trailedSL: trailedSL??null, cmp: cmp??price, strategy: strategy??null, setup: setup??null, tradeType: tradeType??null,
     lots: [{ id: uid(), date, price, qty }] };
   stampPositionPosPct(position);
   state.openTrades.push(position);
@@ -521,16 +548,25 @@ function buildFullBackup(){
   return { version:2, exportedAt:new Date().toISOString(), startingCapital:state.startingCapital, riskPct:state.riskPct, wcs:state.wcs,
     posIdCounters:state.posIdCounters, trades:state.trades, openTrades:state.openTrades, sizingRows:state.sizingRows,
     setups:state.setups, strategies:state.strategies, financialYears:state.financialYears, capitalTransactions:state.capitalTransactions,
-    playbooks:state.playbooks };
+    playbooks:state.playbooks, chargeRates:state.chargeRates, dpCharge:state.dpCharge };
 }
 function exportBackupNow(){
-  window.electronAPI.exportBackup(JSON.stringify(buildFullBackup(), null, 2)).then(res=>{
-    if(res && res.ok) alert(`Backup saved to:\n${res.filePath}`);
+  window.electronAPI.exportBackup(JSON.stringify(buildFullBackup(), null, 2)).then(async res=>{
+    if(res && res.ok){
+      state.lastBackupAt = new Date().toISOString();
+      await persistBackupTimestamp();
+      render();
+      alert(`Backup saved to:\n${res.filePath}`);
+    }
   });
 }
 async function importBackupNow(){
   const res = await window.electronAPI.importBackup();
-  if(!res || !res.ok) return;
+  if(!res) return;
+  if(!res.ok){
+    if(res.error) alert(`Could not read that file:\n${res.error}`);
+    return; // no error field means the user simply canceled the file picker — nothing to report
+  }
   try{
     const data = JSON.parse(res.content);
     if(!confirm('This will replace all current data in the app with the contents of this backup file. This cannot be undone. Continue?')) return;
@@ -539,7 +575,7 @@ async function importBackupNow(){
     await persistCapitalLedger(); await persistFYList();
     alert('Backup restored successfully.');
     render();
-  }catch(e){ alert('This file could not be read as a valid TradeVault backup.'); }
+  }catch(e){ alert(`This file could not be read as a valid TradeVault backup.\n\n${e.message}`); }
 }
 
 // ---- Reset All Data — wipes everything back to a genuine fresh-install state -------------
@@ -593,6 +629,9 @@ async function performResetAll(){
   state.startingCapital = 0;
   state.riskPct = 1;
   state.wcs = 20;
+  state.chargeRates = { ...DEFAULT_CHARGE_RATES };
+  state.dpCharge = DEFAULT_DP_CHARGE;
+  state.lastBackupAt = null;
   state.posIdCounters = {};
   state.lastUpdated = null;
   state.selectedStrategy = 'ALL';
@@ -619,6 +658,8 @@ function applyBackupData(data){
   state.startingCapital = data.startingCapital ?? state.startingCapital;
   state.riskPct = data.riskPct ?? state.riskPct;
   state.wcs = data.wcs ?? state.wcs;
+  state.chargeRates = Object.assign({...DEFAULT_CHARGE_RATES}, data.chargeRates||{});
+  state.dpCharge = data.dpCharge ?? DEFAULT_DP_CHARGE;
   state.posIdCounters = data.posIdCounters ?? {};
   state.trades = data.trades ?? [];
   state.openTrades = data.openTrades ?? [];
@@ -638,7 +679,7 @@ function applyBackupData(data){
 }
 
 async function loadState(){
-  try{ const s = await lsGet('journal-settings'); if(s){ const p=JSON.parse(s.value); state.startingCapital=p.startingCapital; state.riskPct=p.riskPct; state.wcs=p.wcs??20; state.lastUpdated=p.lastUpdated??null; state.posIdCounters=p.posIdCounters??{}; } }catch(e){}
+  try{ const s = await lsGet('journal-settings'); if(s){ const p=JSON.parse(s.value); state.startingCapital=p.startingCapital; state.riskPct=p.riskPct; state.wcs=p.wcs??20; state.lastUpdated=p.lastUpdated??null; state.posIdCounters=p.posIdCounters??{}; state.chargeRates = Object.assign({...DEFAULT_CHARGE_RATES}, p.chargeRates||{}); state.dpCharge = p.dpCharge ?? DEFAULT_DP_CHARGE; state.lastBackupAt = p.lastBackupAt ?? null; } }catch(e){}
   try{ const t = await lsGet('journal-trades'); state.trades = t ? JSON.parse(t.value) : []; }catch(e){ state.trades = []; }
   try{ const o = await lsGet('journal-open'); state.openTrades = o ? JSON.parse(o.value) : []; }catch(e){ state.openTrades = []; }
   // One-time migration: give every open trade a lots history, and enforce single-position-per-symbol
@@ -725,7 +766,13 @@ async function setTheme(theme){
 }
 async function persistSettings(){
   state.lastUpdated = new Date().toISOString();
-  await lsSet('journal-settings', JSON.stringify({startingCapital:state.startingCapital,riskPct:state.riskPct,wcs:state.wcs,lastUpdated:state.lastUpdated,posIdCounters:state.posIdCounters}));
+  await lsSet('journal-settings', JSON.stringify({startingCapital:state.startingCapital,riskPct:state.riskPct,wcs:state.wcs,lastUpdated:state.lastUpdated,posIdCounters:state.posIdCounters,chargeRates:state.chargeRates,dpCharge:state.dpCharge,lastBackupAt:state.lastBackupAt}));
+}
+// Separate from persistSettings deliberately — exporting a backup doesn't change any trading data,
+// so it shouldn't bump the "Last Updated" timestamp shown in the top bar (that's reserved for actual
+// edits). This writes the same journal-settings record but leaves lastUpdated untouched.
+async function persistBackupTimestamp(){
+  await lsSet('journal-settings', JSON.stringify({startingCapital:state.startingCapital,riskPct:state.riskPct,wcs:state.wcs,lastUpdated:state.lastUpdated,posIdCounters:state.posIdCounters,chargeRates:state.chargeRates,dpCharge:state.dpCharge,lastBackupAt:state.lastBackupAt}));
 }
 async function persistTrades(){ await lsSet('journal-trades', JSON.stringify(state.trades)); await persistSettings(); }
 async function persistOpen(){ await lsSet('journal-open', JSON.stringify(state.openTrades)); await persistSettings(); }
@@ -964,6 +1011,7 @@ function renderDashboard(){
   const filteredClosed = getFilteredTrades();
   const curveStartCap = state.selectedFY==='ALL' ? earliestStartingCapital() : ((getFYEntry(state.selectedFY)||{}).openingBalance ?? earliestStartingCapital());
   const a = analytics(filteredClosed, curveStartCap);
+  const noSLCount = filteredClosed.filter(t=>t.rrr==null).length; // excluded from Avg (R) / R-Multiple by Setup — no Init SL logged
   const setups = setupStats(filteredClosed);
   const rBySetupTrades = {};
   filteredClosed.forEach(t=>{ const key=t.setup||'Untagged'; (rBySetupTrades[key]=rBySetupTrades[key]||[]).push(t); });
@@ -1014,7 +1062,7 @@ function renderDashboard(){
     <div class="stat"><div class="lbl">Booked P&amp;L</div><div class="val ${cls(a.totalPnl)}">${fmtMoney(a.totalPnl)}</div></div>
     <div class="stat"><div class="lbl">Open P&amp;L</div><div class="val ${cls(openPnl)}">${fmtMoney(openPnl)}</div></div>
     <div class="stat"><div class="lbl">Win Rate</div><div class="val">${fmtPct(a.winRate)}</div></div>
-    <div class="stat"><div class="lbl">Avg (R)</div><div class="val ${a.expectancyR>0?'pos':(a.expectancyR<0?'neg':'')}">${fmtR(a.expectancyR)}</div></div>
+    <div class="stat"><div class="lbl">Avg (R)</div><div class="val ${a.expectancyR>0?'pos':(a.expectancyR<0?'neg':'')}">${fmtR(a.expectancyR)}</div>${noSLCount>0?`<div class="sub-val" style="color:var(--muted2)">${noSLCount} excl. (no SL)</div>`:''}</div>
     <div class="stat"><div class="lbl">(P) Factor</div><div class="val">${a.profitFactor!=null?a.profitFactor.toFixed(2):'—'}</div></div>
     <div class="stat"><div class="lbl">Max Drawdown</div><div class="val neg">${fmtMoney(-a.maxDD)}</div><div class="sub-val neg">${fmtPct(a.maxDDPct)}</div></div>
     <div class="stat"><div class="lbl">Streak</div><div class="val ${a.curType==='W'?'pos':(a.curType==='L'?'neg':'')}">${a.curStreak? `${a.curStreak} ${a.curType==='W'?'Win':'Loss'}` : '0'}</div></div>
@@ -1024,7 +1072,7 @@ function renderDashboard(){
     <div class="hist-wrap" id="histChart"></div>
   </div>
   <div class="panel" style="margin-bottom:20px">
-    <h3>R-Multiple by Setup <small>${fyTag} · ${strategyTag} · P&amp;L tells you what happened, this tells you if it's repeatable</small></h3>
+    <h3>R-Multiple by Setup <small>${fyTag} · ${strategyTag} · P&amp;L tells you what happened, this tells you if it's repeatable${noSLCount>0?` · ${noSLCount} trade${noSLCount>1?'s':''} excluded — no Init SL logged`:''}</small></h3>
     <div class="hist-wrap">${setupRDist.length? svgSetupRHistogram(setupRDist) : '<p class="empty" style="padding:20px 0">No trades with a logged Init SL yet — R-Multiple needs an Init SL to calculate.</p>'}</div>
   </div>
   <div class="grid2">
@@ -1082,7 +1130,7 @@ function openViolationsDrilldown(){
     <h3>Risk per Trade Violations</h3>
     <p class="desc">Trades that exceeded your ${riskLimitPct}% Risk per Trade limit — highest first.</p>
     <div class="table-scroll" style="max-height:360px;margin-top:12px"><table><thead><tr>
-      <th>Symbol</th><th>Entry</th><th>Exit</th><th>Entry Price</th><th>Init SL</th><th>Qty</th><th style="text-align:right">Risk %</th>
+      <th>Symbol</th><th>Entry</th><th>Exit</th><th>Entry ₹</th><th>Init SL</th><th>Qty</th><th style="text-align:right">Risk %</th>
     </tr></thead><tbody>
     ${dashboardViolatingTrades.map(t=>`<tr>
       <td>${t.symbol}</td><td>${fmtDate(t.entry)}</td><td>${fmtDate(t.exit)}</td>
@@ -1209,15 +1257,22 @@ function svgHistogram(hist){
 function renderOpenTab(){
   const openComputed = state.openTrades.map(computeOpen);
   const openPnl = openComputed.reduce((s,t)=>s+t.absRet,0);
+  const trailPnl = openComputed.reduce((s,t)=>{
+    if(t.trailedSL==null || t.trailedSL==='') return s;
+    const tAbsRet = t.side==='SHORT' ? (t.entryPrice-t.trailedSL)*t.qty : (t.trailedSL-t.entryPrice)*t.qty;
+    return s+tAbsRet;
+  },0);
+  const hasTrail = openComputed.some(t=>t.trailedSL!=null && t.trailedSL!=='');
   return `
   <div class="panel">
-    <h3>Open Trades <small>${openComputed.length} live · ${fmtMoney(openPnl)} unrealized${state.cmpLastUpdated?` · CMP as of ${new Date(state.cmpLastUpdated).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'})}`:''}</small>
+    <h3>Open Trades <small>${openComputed.length} live · <span style="color:var(--text)">Open P/L</span> - <span class="${cls(openPnl)}">${fmtMoney(openPnl)}</span>${hasTrail?` · <span style="color:var(--text)">Trailing P/L</span> - <span class="${cls(trailPnl)}">${fmtMoney(trailPnl)}</span>`:''}${state.cmpLastUpdated?` · CMP as of ${new Date(state.cmpLastUpdated).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'})}`:''}</small>
       <button class="btn btn-sm" id="btnRefreshCmp">⟳ Refresh CMP</button>
       <button class="btn btn-primary btn-sm" id="btnAddOpen">+ Add Position</button></h3>
-    <div class="table-scroll"><table><thead><tr><th>Symbol</th><th>Side</th><th>Entry Date</th><th style="text-align:right">Entry Price</th><th style="text-align:right">Qty</th><th style="text-align:right">Invested</th><th style="text-align:right">POS %</th><th style="text-align:right">Init SL</th><th style="text-align:right">Trail SL</th><th style="text-align:right">CMP</th><th style="text-align:right">Net P/L</th><th style="text-align:right">P/L %</th><th style="text-align:right">R-Mult</th><th>Strategy</th><th>Setup</th><th></th></tr></thead><tbody>
+    <div class="table-scroll"><table><thead><tr><th>Symbol</th><th>Side</th><th>Type</th><th>Entry Date</th><th style="text-align:right">Entry ₹</th><th style="text-align:right">Qty</th><th style="text-align:right">Invested</th><th style="text-align:right">POS %</th><th style="text-align:right">Init SL</th><th style="text-align:right">Trail SL</th><th style="text-align:right">CMP</th><th style="text-align:right">Net P/L</th><th style="text-align:right">P/L %</th><th style="text-align:right">R-Mult</th><th>Strategy</th><th>Setup</th><th></th></tr></thead><tbody>
     ${openComputed.length? openComputed.map(t=>`<tr>
       <td style="font-family:var(--font-ui);font-weight:600">${t.symbol}<div class="posid-label">${t.posId||'—'}</div></td>
       <td><span class="side-${t.side.toLowerCase()}">${t.side}</span></td>
+      <td>${t.tradeType?`<span class="pill" title="${tradeTypeLabel(t.tradeType)}">${t.tradeType}</span>`:'—'}</td>
       <td>${fmtDate(t.entry)}</td><td style="text-align:right">${t.entryPrice.toFixed(2)}</td><td style="text-align:right">${t.qty}</td>
       <td style="text-align:right">${fmtMoney(t.capital)}</td>
       <td style="text-align:right">${t.posPct!=null?fmtPct(t.posPct):'—'}</td>
@@ -1232,7 +1287,7 @@ function renderOpenTab(){
         <button class="icon-btn" data-edit-open="${t.id}">✎</button>
       </div></td>
     </tr>${t.lots.length>1 ? `
-    <tr class="entries-row"><td colspan="16">
+    <tr class="entries-row"><td colspan="17">
       <div class="entries-list">${sortLotsAsc(t.lots).map(l=>{
         const lotSL = (l.initSL!=null) ? l.initSL : t.initSL;
         const extra = lotSL!=null ? `INIT SL ${lotSL}` : null;
@@ -1240,7 +1295,7 @@ function renderOpenTab(){
         <span>${fmtDate(l.date)} | ${(+l.price).toFixed(2)} | Qty ${l.qty}${extra?` | ${extra}`:''}${l.notes?` | ${l.notes}`:''}</span>
         <button class="icon-btn" data-edit-lot="${t.id}|${l.id}" title="Edit this entry">✎</button>
       </div>`;}).join('')}</div>
-    </td></tr>` : ''}`).join('') : '<tr><td colspan="16" class="empty">No open trades yet</td></tr>'}
+    </td></tr>` : ''}`).join('') : '<tr><td colspan="17" class="empty">No open trades yet</td></tr>'}
     </tbody></table></div>
   </div>`;
 }
@@ -1290,12 +1345,26 @@ function orderTradeLogRows(trades){
   blocks.sort((a,b)=>b.anchor-a.anchor);
   return blocks.flatMap(b=>b.items.map((t,i)=>({...t, __exitIdx:i+1, __exitCount:b.items.length})));
 }
+// Charges & Tax — a simple % of Turnover (Entry Value + Exit Value — both legs actually traded),
+// applied only to Booked Trades (never Open Trades, since a position isn't "closed" yet).
+// DP charge is added on top for Equity Delivery (ED) only — it's a flat ₹ fee per scrip on the sell,
+// not a % of turnover, since demat charges don't scale with trade size.
+function calcCharge(entryValue, exitValue, tradeType){
+  if(!tradeType) return 0;
+  const rate = state.chargeRates[tradeType];
+  const turnover = entryValue + exitValue;
+  const pctCharge = rate ? turnover*rate/100 : 0;
+  const dp = tradeType==='ED' ? (state.dpCharge||0) : 0;
+  return pctCharge + dp;
+}
 function renderLogTab(){
   const filteredClosed = getFilteredTrades();
   const uniqueSetups = ['ALL', ...new Set(state.trades.map(t=>t.setup||'Untagged'))];
+  const totalCharges = filteredClosed.reduce((s,t)=>s+t.charge, 0); // t.pnl is already net of charges (see computeClosed), so no re-subtraction here
+  const bookedPnl = filteredClosed.reduce((s,t)=>s+t.pnl, 0);
   return `
   <div class="panel">
-    <h3>Booked Trades <small>${filteredClosed.length} of ${state.trades.length}</small>
+    <h3>Booked Trades <small>${filteredClosed.length} of ${state.trades.length} · <span style="color:var(--text)">Net Booked P/L</span> - <span class="${cls(bookedPnl)}">${fmtMoney(bookedPnl)}</span> · <span style="color:var(--text)">Charges &amp; Tax</span> - <span class="${totalCharges>0?'neg':'neu'}">${fmtMoney(totalCharges)}</span></small>
       <button class="btn btn-primary btn-sm" id="btnAddTrade">+ Log Trade</button></h3>
     <div class="filters">
       <input type="text" id="fQ" placeholder="Search symbol or Position ID…">
@@ -1303,14 +1372,15 @@ function renderLogTab(){
       <div class="fy-picker"><select id="fSetup">${uniqueSetups.map(s=>`<option value="${s}">${s==='ALL'?'All Setups':s}</option>`).join('')}</select></div>
     </div>
     <div class="table-scroll"><table><thead><tr>
-      <th>Symbol</th><th>Side</th><th>Entry Date</th><th>Exit Date</th><th style="text-align:right">Entry Price</th><th style="text-align:right">Exit Price</th><th style="text-align:right">Qty</th><th style="text-align:right">Net P/L</th><th style="text-align:right">P/L %</th><th style="text-align:right">R-Mult</th><th style="text-align:right">Impact</th><th>Strategy</th><th>Setup</th><th style="text-align:right">Hold</th><th>Notes</th><th></th>
+      <th>Symbol</th><th>Side</th><th>Type</th><th>Entry Date</th><th>Exit Date</th><th style="text-align:right">Entry ₹</th><th style="text-align:right">Exit ₹</th><th style="text-align:right">Qty</th><th style="text-align:right">Net P/L</th><th style="text-align:right">P/L %</th><th style="text-align:right">R-Mult</th><th style="text-align:right">Impact</th><th>Strategy</th><th>Setup</th><th style="text-align:right">Hold</th><th>Notes</th><th></th>
     </tr></thead><tbody>
     ${filteredClosed.length? orderTradeLogRows(filteredClosed).map(t=>`<tr>
       <td style="font-family:var(--font-ui);font-weight:600">${t.symbol}${t.posId?`<div class="posid-label">${t.posId}${t.__exitCount>1?` (exit ${t.__exitIdx}/${t.__exitCount})`:''}</div>`:''}</td>
       <td><span class="side-${t.side.toLowerCase()}">${t.side}</span></td>
+      <td>${t.tradeType?`<span class="pill" title="${tradeTypeLabel(t.tradeType)}">${t.tradeType}</span>`:'—'}</td>
       <td>${fmtDate(t.entry)}</td><td>${fmtDate(t.exit)}</td>
       <td style="text-align:right">${t.entryPrice.toFixed(2)}</td><td style="text-align:right">${t.exitPrice.toFixed(2)}</td><td style="text-align:right">${t.qty}</td>
-      <td class="${cls(t.pnl)}" style="text-align:right">${fmtMoney(t.pnl)}</td>
+      <td class="${cls(t.pnl)}" style="text-align:right"${t.charge>0?` title="Gross: ${fmtMoney(t.grossPnl)} · Charges: ${fmtMoney(t.charge)} · Net: ${fmtMoney(t.pnl)}"`:''}>${fmtMoney(t.pnl)}</td>
       <td class="${cls(t.pnl)}" style="text-align:right">${fmtPct(t.pctReturn)}</td>
       <td class="${t.rrr>0?'pos':(t.rrr<0?'neg':'')}" style="text-align:right">${fmtR(t.rrr)}</td>
       <td class="${t.pImpactAtClose>0?'pos':(t.pImpactAtClose<0?'neg':'')}" style="text-align:right">${t.pImpactAtClose!=null?fmtPct(t.pImpactAtClose):'—'}</td>
@@ -1319,7 +1389,7 @@ function renderLogTab(){
       <td style="text-align:right">${t.exit ? fmtHold(t.holdDays) : 'Open'}</td>
       <td class="remark" title="${(()=>{ const p=parsePlanTag(t.remarks); return (p.text||'').replace(/"/g,'&quot;'); })()}">${(()=>{ const p=parsePlanTag(t.remarks); const planLine = p.followed===true? '<div>Plan: ✅</div>' : p.followed===false? '<div>Plan: ❌</div>' : ''; const noteLine = p.text? `<div>${p.text}</div>` : ''; return planLine+noteLine; })()}</td>
       <td><div class="row-actions"><button class="icon-btn" data-edit="${t.id}">✎</button></div></td>
-    </tr>`).join('') : '<tr><td colspan="16" class="empty">No trades match these filters</td></tr>'}
+    </tr>`).join('') : '<tr><td colspan="17" class="empty">No trades match these filters</td></tr>'}
     </tbody></table></div>
   </div>`;
 }
@@ -1340,8 +1410,8 @@ function renderSizingTab(){
   return `
   <div class="panel">
     <h3>Position Calculator <small style="color:var(--text)">capital ${fmtMoney(defaultCapital)} · risking ${state.riskPct}% = ${fmtMoney(defaultCapital*state.riskPct/100)}/trade</small></h3>
-    <p class="desc" style="margin-bottom:14px">Enter entry price and stop loss — quantity sizes to your risk-per-trade setting, rounded up to the nearest 5.</p>
-    <div class="table-scroll"><table><thead><tr><th>Stock</th><th>Side</th><th>Entry Price</th><th>Stop Loss</th><th>Risk/Share</th><th>INIT SL %</th><th>Quantity</th><th>Position Value</th><th>Position Size%</th><th></th></tr></thead><tbody>
+    <p class="desc" style="margin-bottom:14px">Enter Entry ₹ and stop loss — quantity sizes to your risk-per-trade setting, rounded up to the nearest 5.</p>
+    <div class="table-scroll"><table><thead><tr><th>Stock</th><th>Side</th><th>Entry ₹</th><th>Stop Loss</th><th>Risk/Share</th><th>INIT SL %</th><th>Quantity</th><th>Position Value</th><th>Position Size%</th><th></th></tr></thead><tbody>
     ${rows.length? rows.map((r,i)=>`<tr>
       <td><input class="mini" data-i="${i}" data-f="symbol" value="${r.symbol||''}" style="width:90px"></td>
       <td><select class="mini" data-i="${i}" data-f="side"><option value="LONG" ${r.side==='LONG'?'selected':''}>Long</option><option value="SHORT" ${r.side==='SHORT'?'selected':''}>Short</option></select></td>
@@ -1371,7 +1441,7 @@ function wireSizingTab(){
     const i = parseInt(b.dataset.addOpen); const r = state.sizingRows[i];
     const defaultCapital = getCurrentCapital((getCurrentFYEntry()||{}).fy || currentFY());
     const c = computeSizing(r, defaultCapital, state.riskPct);
-    if(!r.symbol || !c.qty){ alert('Fill symbol, entry price and stop loss first.'); return; }
+    if(!r.symbol || !c.qty){ alert('Fill symbol, Entry ₹ and stop loss first.'); return; }
     const { merged } = mergeOrCreateOpenPosition({ symbol:r.symbol, side:r.side, date:new Date().toISOString().slice(0,10),
       price:r.entryPrice, qty:c.qty, initSL:r.sl, trailedSL:null, cmp:r.entryPrice, strategy:null, setup:null });
     if(merged) alert(`${r.symbol.toUpperCase()} was already open — added as a new entry to the existing position.`);
@@ -1396,6 +1466,13 @@ function tagFieldFor(group){ return group==='strategy' ? 'strategy' : 'setup'; }
 function persistTagList(group){ return group==='strategy' ? persistStrategies() : persistSetups(); }
 
 function renderConfigTab(){
+  const lastBackupNote = (()=>{
+    if(!state.lastBackupAt) return { text:'Never backed up', color:'var(--red)' };
+    const days = Math.floor((Date.now()-new Date(state.lastBackupAt).getTime())/86400000);
+    const text = days<=0 ? 'Backed up today' : days===1 ? 'Backed up 1 day ago' : `Backed up ${days} days ago`;
+    const color = days<=7 ? 'var(--teal)' : days<=14 ? 'var(--amber)' : 'var(--red)';
+    return { text, color };
+  })();
   return `
   <div class="panel">
     ${renderTagSection('strategy', state.strategies, 'Strategies',
@@ -1419,7 +1496,7 @@ function renderConfigTab(){
     <p class="desc" style="margin-top:10px"><b>Export Data</b> downloads trades or transactions as .xlsx. <b>Import Trades</b> bulk-imports from CSV/Excel, with a preview step first.</p>
 
     <h4 style="margin-top:22px;padding-top:18px;border-top:1px solid var(--border);font-family:var(--font-display);font-size:13px;font-weight:600;color:var(--text)">Backup</h4>
-    <p class="desc" style="margin-top:6px">A full snapshot of everything in the app, not just one report.</p>
+    <p class="desc" style="margin-top:6px">A full snapshot of everything in the app, not just one report. <span style="color:${lastBackupNote.color};font-weight:600">${lastBackupNote.text}</span></p>
     <div class="modal-actions" style="justify-content:flex-start;flex-wrap:wrap;gap:10px;margin-top:10px">
       <button class="btn" id="btnExportBackup">Export Backup</button>
       <button class="btn" id="btnImportBackup">Import Backup</button>
@@ -1473,6 +1550,28 @@ function wireConfigTab(){
   });
 }
 
+function renderChargesTab(){
+  return `
+  <div class="panel" style="margin-top:20px">
+    <h3>Charges &amp; Tax</h3>
+    <p class="desc" style="margin-bottom:14px">Set a simple % charge for each Trade Type. Applied using the Type picked on each open/booked trade.</p>
+    ${TRADE_TYPES.map(x=>`
+    <div class="mm-row"><div class="mm-lbl">${x.label} (${x.code})</div><div class="mm-val"><input type="number" step="any" min="0" class="charge-rate-input" data-code="${x.code}" value="${state.chargeRates[x.code]??0}" style="width:90px;text-align:right">%</div></div>`).join('')}
+    <div class="mm-row"><div class="mm-lbl">DP Charges (₹ per scrip)<br><span style="font-size:10px;color:var(--muted2);opacity:.75">Applies only on Equity Delivery (ED) — flat, once per booked trade, regardless of quantity</span></div><div class="mm-val"><input type="number" step="any" min="0" id="dpChargeInput" value="${state.dpCharge??0}" style="width:90px;text-align:right">₹</div></div>
+    <div class="modal-actions" style="justify-content:flex-start;margin-top:14px"><button class="btn btn-primary" id="btnSaveCharges">Save</button></div>
+  </div>`;
+}
+function wireChargesTab(){
+  const btn = document.getElementById('btnSaveCharges');
+  if(btn) btn.onclick = ()=>{
+    document.querySelectorAll('.charge-rate-input').forEach(el=>{
+      state.chargeRates[el.dataset.code] = parseFloat(el.value)||0;
+    });
+    const dpEl = document.getElementById('dpChargeInput');
+    if(dpEl) state.dpCharge = parseFloat(dpEl.value)||0;
+    persistSettings(); render();
+  };
+}
 // ---- Money Management tab ----------------------------------------------------------------
 function renderCapitalTab(){
   const isAllTime = state.selectedFY==='ALL';
@@ -1500,9 +1599,10 @@ function renderCapitalTab(){
     : isAllTime ? t.fy===realCurrentFY() // manual entries: only ones actually in the real current FY
     : isViewingCurrent; // Dr / Cr manual entries
   const capitalRowLabel = isAllTime ? 'Current Capital' : (isViewingCurrent?'Current Capital':'Closing Capital');
-  const capitalRowCaption = (isAllTime || isViewingCurrent) ? '<br><span style="font-size:10px;color:var(--muted2);opacity:.75">Capital Balance + Realized P/L</span>' : '';
+  const capitalRowCaption = (isAllTime || isViewingCurrent) ? '<br><span style="font-size:10px;color:var(--muted2);opacity:.75">Capital Balance + Net Booked P/L</span>' : '';
   return `
   ${renderSizingTab()}
+  ${renderChargesTab()}
   <div class="panel" style="margin-top:20px">
     <h3>Capital &amp; Risk <small>${isAllTime?'All Time':`FY ${fy}`}${!isViewingCurrent && !isAllTime?' · read-only (not the current FY)':''}</small></h3>
     <div class="mm-row"><div class="mm-lbl">${capitalRowLabel} ${capitalRowCaption}</div><div class="mm-val">${fmtMoney(currentCapital)}</div></div>
@@ -1555,6 +1655,7 @@ function wireCapitalTab(){
   if(addTxBtn) addTxBtn.onclick = openAddCapitalTxModal;
   document.querySelectorAll('[data-edit-tx]').forEach(b=>b.onclick=()=>openEditCapitalTxModal(b.dataset.editTx));
   wireSizingTab();
+  wireChargesTab();
 }
 
 // ---- Add Deposit / Withdrawal / Adjustment ----
@@ -1677,7 +1778,7 @@ function openCloseFYStep1(){
     <h3>Close Financial Year ${cur.fy}</h3>
     <div style="margin-bottom:16px">
       <div class="mm-row"><div class="mm-lbl">Financial Year</div><div class="mm-val">${cur.fy}</div></div>
-      <div class="mm-row"><div class="mm-lbl">Realized (Booked) Net P/L</div><div class="mm-val ${cls(netPL)}">${fmtMoney(netPL)}</div></div>
+      <div class="mm-row"><div class="mm-lbl">Net Booked P/L</div><div class="mm-val ${cls(netPL)}">${fmtMoney(netPL)}</div></div>
       <div class="mm-row"><div class="mm-lbl">P/L Transfer Amount</div><div class="mm-val ${cls(netPL)}">${fmtMoney(netPL)}</div></div>
     </div>
     <p class="desc">Continuing will:</p>
@@ -1760,8 +1861,9 @@ function inRange(dateStr, range){
 function tradeLogData(range){
   return state.trades.map(computeClosed).filter(t=>inRange(t.exit, range))
     .sort((a,b)=>new Date(a.exit||0)-new Date(b.exit||0))
-    .map(t=>({ Symbol:t.symbol, Side:t.side, 'Entry Date':t.entry, 'Exit Date':t.exit,
-      'Entry Price':t.entryPrice, 'Exit Price':t.exitPrice, Qty:t.qty,
+    .map(t=>({ Symbol:t.symbol, Side:t.side, 'Trade Type':t.tradeType||'', 'Entry Date':t.entry, 'Exit Date':t.exit,
+      'Entry ₹':t.entryPrice, 'Exit ₹':t.exitPrice, Qty:t.qty,
+      'Gross P/L': Math.round(t.grossPnl*100)/100, 'Charges & Tax': Math.round(t.charge*100)/100,
       'Net P/L':Math.round(t.pnl*100)/100, 'P/L %': t.pctReturn!=null? +(t.pctReturn*100).toFixed(2) : '', 'R-Mult': t.rrr!=null? +t.rrr.toFixed(2) : '',
       'Impact': t.pImpactAtClose!=null? +(t.pImpactAtClose*100).toFixed(2) : '', 'Hold (days)': t.holdDays??'',
       Strategy: t.strategy||'Not Assigned', 'Setup': t.setup||'', Notes: t.remarks||'' }));
@@ -1769,7 +1871,7 @@ function tradeLogData(range){
 function openPositionsData(range){
   return state.openTrades.map(computeOpen).filter(t=> !range.start ? true : inRange(t.entry, range))
     .sort((a,b)=>new Date(a.entry||0)-new Date(b.entry||0))
-    .map(t=>({ 'Position ID':t.posId||'', Symbol:t.symbol, Side:t.side, 'Entry Date':t.entry, 'Entry Price':t.entryPrice, Qty:t.qty,
+    .map(t=>({ 'Position ID':t.posId||'', Symbol:t.symbol, Side:t.side, 'Entry Date':t.entry, 'Entry ₹':t.entryPrice, Qty:t.qty,
       'Invested':Math.round(t.capital*100)/100, 'Init SL':t.initSL??'', 'Trailed SL':t.trailedSL??'', 'CMP':t.cmp,
       'Unrealized P/L':Math.round(t.absRet*100)/100, 'POS %': t.posPct!=null? +(t.posPct*100).toFixed(2):'',
       Strategy:t.strategy||'Not Assigned', 'Setup':t.setup||'' }));
@@ -1910,21 +2012,22 @@ function renderHowToTab(){
     <h3>How to Use This Journal</h3>
     <div class="howto">
       <h4>1. Dashboard</h4>
-      <p>Your performance summary, scoped to the <b>FY</b> and <b>Strategy</b> selected in the top bar (FY defaults to the current financial year, Strategy defaults to All Strategies). The <b>Edge Distribution (R)</b> histogram is the most important chart here — it shows your edge shape, not just win rate. A trade's R = P&amp;L ÷ Initial Risk, so you must log an Init SL on every trade for it to count; trades without one can't be plotted. A profitable system skews right even with a sub-50% win rate — that's the shape you're looking for. <b>R-Multiple by Setup</b> shows one bar per setup — its Avg R, not its P&amp;L — sorted the same way, so you can spot which setups actually have an edge rather than which just made the most money. A setup can look profitable from a few big wins while still having a weak or negative edge on average, and this is where that becomes visible. <b>Avg R</b> is the average R across all trades; positive means your system makes money per unit of risk over time. <b>(P) Factor</b> is gross wins ÷ gross losses — above 1.5 is solid. <b>Max Drawdown</b> shows both the amount and % decline from your equity peak. <b>YTD Return %</b> is how much your Current Capital has grown or shrunk since the start of the current financial year, and resets automatically every 1 April. <b>Avg Holding</b> is the average number of days between entry and exit across closed trades. <b>Streak</b> shows your current run, e.g. "3 Win" or "2 Loss". <b>Performance by Setup</b> ranks your tagged setups by real P&amp;L, and the <b>Monthly Performance</b> table breaks the selected FY down month by month, including a month-level <b>(P) Factor</b> column (gross wins ÷ gross losses for that month) alongside <b>P/L %</b> (that month's Net P&amp;L ÷ that month's starting capital — the portfolio's actual monthly return) and <b>Avg R</b> — together these show a month's result, its consistency, and its edge quality without needing three separate charts. In <b>Discipline Check</b>, <b>Risk per Trade</b> shows a <b>Violations</b> count — trades whose actual risk (Init SL distance × Qty, as a % of capital at entry) exceeded your configured Risk per Trade % — colored green (0–3 violations), amber (4–7), or red (8+, or any single trade risking more than 1 percentage point over your limit) — click <b>Violations: X</b> when it's above zero to see exactly which trades breached the limit. <b>Capital Protection</b> shows <b>Remaining</b> — how much of that protection amount is left after this view's Net P&L, colored green above 50%, amber from 25–50%, red at or below 25% — click <b>Remaining: XX%</b> to see every trade in view, worst P&amp;L first, with a running total showing exactly how each one added to or ate into it. All of these update automatically when you change the FY or Strategy filter.</p>
+      <p>Your performance summary, scoped to the <b>FY</b> and <b>Strategy</b> selected in the top bar (FY defaults to the current financial year, Strategy defaults to All Strategies). The <b>Edge Distribution (R)</b> histogram is the most important chart here — it shows your edge shape, not just win rate. A trade's R = P&amp;L ÷ Initial Risk, so you must log an Init SL on every trade for it to count; trades without one can't be plotted. A profitable system skews right even with a sub-50% win rate — that's the shape you're looking for. <b>R-Multiple by Setup</b> shows one bar per setup — its Avg R, not its P&amp;L — sorted the same way, so you can spot which setups actually have an edge rather than which just made the most money. A setup can look profitable from a few big wins while still having a weak or negative edge on average, and this is where that becomes visible. <b>Avg R</b> is the average R across all trades; positive means your system makes money per unit of risk over time — trades with no Init SL logged are silently left out of this average and out of R-Multiple by Setup, and whenever that happens both show a small "X excluded — no Init SL" note so you always know if the number reflects your full trade set or a subset. <b>(P) Factor</b> is gross wins ÷ gross losses — above 1.5 is solid. <b>Max Drawdown</b> shows both the amount and % decline from your equity peak. <b>YTD Return %</b> is how much your Current Capital has grown or shrunk since the start of the current financial year, and resets automatically every 1 April. <b>Avg Holding</b> is the average number of days between entry and exit across closed trades. <b>Streak</b> shows your current run, e.g. "3 Win" or "2 Loss". <b>Performance by Setup</b> ranks your tagged setups by real P&amp;L, and the <b>Monthly Performance</b> table breaks the selected FY down month by month, including a month-level <b>(P) Factor</b> column (gross wins ÷ gross losses for that month) alongside <b>P/L %</b> (that month's Net P&amp;L ÷ that month's starting capital — the portfolio's actual monthly return) and <b>Avg R</b> — together these show a month's result, its consistency, and its edge quality without needing three separate charts. In <b>Discipline Check</b>, <b>Risk per Trade</b> shows a <b>Violations</b> count — trades whose actual risk (Init SL distance × Qty, as a % of capital at entry) exceeded your configured Risk per Trade % — colored green (0–3 violations), amber (4–7), or red (8+, or any single trade risking more than 1 percentage point over your limit) — click <b>Violations: X</b> when it's above zero to see exactly which trades breached the limit. <b>Capital Protection</b> shows <b>Remaining</b> — how much of that protection amount is left after this view's Net P&L, colored green above 50%, amber from 25–50%, red at or below 25% — click <b>Remaining: XX%</b> to see every trade in view, worst P&amp;L first, with a running total showing exactly how each one added to or ate into it. All of these update automatically when you change the FY or Strategy filter.</p>
       <h4>2. Open Trades</h4>
-      <p>Your live book — and the only place you should manually type in a new trade. The journal maintains <b>one Open Trade per symbol</b>; if you add a position for a symbol that's already open, it's folded into the existing one as a new entry rather than creating a duplicate. Every position gets a permanent <b>Position ID</b> the moment it's created — shown as a small label under the symbol, formatted like <b>FY2627-0001</b> (financial year + a sequence number for that year). It's assigned once and never changes, no matter how many times you add to or exit the position. Each position also carries a Strategy and a Setup (picked from your configurable lists), plus Init SL, Trail SL and CMP — update CMP and Trail SL as the trade develops and unrealized P&amp;L updates instantly.</p>
-      <p>If you've added to a position more than once, a simple entry summary appears below it — one row per entry, oldest first, showing date, price, quantity and Init SL (when set) with Notes if any, and a ✎ right next to the summary to edit that single entry's Entry Date, Entry Price, Quantity, Init SL and Notes. The edit dialog also shows a live INIT SL % (computed from that entry's own Entry Price against its Init SL, or the position's Init SL if the entry doesn't have its own) and, when the position has more than one entry, a Delete button to remove that entry entirely. Editing or deleting an entry recalculates the position's Average Entry Price, Total Quantity and Invested, without changing its Position ID, its <b>POS %</b>, or the rest of its history — a position always keeps at least one entry, so Delete is hidden when only one remains. A position built from a single entry doesn't show this list — edit it directly from the ✎ on its row instead. The <b>Invested</b> column shows the capital currently deployed in each open trade (Entry Price × Qty). <b>POS %</b> is that as a share of your Current Capital, but unlike Invested it isn't live — it's set once when the position is first opened, and only updates again when you add a new entry (scale in) using the total Invested at that moment; it deliberately ignores CMP movement and any capital changes from your other trades, so it always reflects capital actually committed, not a moving target. <b>R-Mult</b> is Net P/L ÷ Initial Risk, calculated live from the position's current unrealized Net P/L for as long as it stays open — once you exit, this becomes the realized R-Mult shown in the Booked Trades.</p>
-      <p><b>Add</b> — scale into an existing position. Enter just Entry Date, Entry Price and Added Quantity; nothing else needs re-entering. The position's average entry price and total quantity recalculate automatically (weighted by size), its Position ID stays exactly the same, and a new line appears in the entry summary.</p>
-      <p><b>Exit</b> — scale out or close a position. You see the position's details for reference (read-only) and enter Exit Price, Exit Quantity (defaults to the full open quantity) and optional Notes. Quantity is reduced <b>FIFO</b> — oldest entries are exited first, matching how exchanges actually account for it. Exit less than the full quantity and the remainder stays open with its entries updated; exit the full quantity and the position closes and disappears from this tab.</p>
-      <p>Either way, a <b>Booked Trades entry is created automatically</b> for exactly the quantity you exited — carrying the same Position ID as the position it came from, with its own realized Net P/L, R-Mult and Hold calculated from the FIFO-matched entry price and date. Its <b>Impact</b> is calculated fresh from your Current Capital at this exact moment, then locked in permanently. You never re-type Symbol, Strategy, Setup or Init SL to close a trade.</p>
+      <p>Your live book — and the only place you should manually type in a new trade. The journal maintains <b>one Open Trade per symbol</b>; if you add a position for a symbol that's already open, it's folded into the existing one as a new entry rather than creating a duplicate. Every position gets a permanent <b>Position ID</b> the moment it's created — shown as a small label under the symbol, formatted like <b>FY2627-0001</b> (financial year + a sequence number for that year). It's assigned once and never changes, no matter how many times you add to or exit the position. Each position also carries a Strategy and a Setup (picked from your configurable lists), a <b>Type</b> (Equity Intraday, Equity Delivery, Equity Future, Equity Option, Commodity Future, or Commodity Option — used later by Charges &amp; Tax to work out real cost, and carried over automatically into the Booked Trade when you exit), plus Init SL, Trail SL and CMP — update CMP and Trail SL as the trade develops and unrealized P&amp;L updates instantly. At the top of the table, <b>Open P/L</b> is your total unrealized P&amp;L across every open position, and <b>Trailing P/L</b> (shown only when at least one position has a Trail SL set) is what you'd lock in if every trailing stop were hit right now — both colored green or red by sign.</p>
+      <p>If you've added to a position more than once, a simple entry summary appears below it — one row per entry, oldest first, showing date, price, quantity and Init SL (when set) with Notes if any, and a ✎ right next to the summary to edit that single entry's Entry Date, Entry ₹, Quantity, Init SL and Notes. The edit dialog also shows a live INIT SL % (computed from that entry's own Entry ₹ against its Init SL, or the position's Init SL if the entry doesn't have its own) and, when the position has more than one entry, a Delete button to remove that entry entirely. Editing or deleting an entry recalculates the position's Average Entry ₹, Total Quantity and Invested, without changing its Position ID, its <b>POS %</b>, or the rest of its history — a position always keeps at least one entry, so Delete is hidden when only one remains. A position built from a single entry doesn't show this list — edit it directly from the ✎ on its row instead. The <b>Invested</b> column shows the capital currently deployed in each open trade (Entry ₹ × Qty). <b>POS %</b> is that as a share of your Current Capital, but unlike Invested it isn't live — it's set once when the position is first opened, and only updates again when you add a new entry (scale in) using the total Invested at that moment; it deliberately ignores CMP movement and any capital changes from your other trades, so it always reflects capital actually committed, not a moving target. <b>R-Mult</b> is Net P/L ÷ Initial Risk, calculated live from the position's current unrealized Net P/L for as long as it stays open — once you exit, this becomes the realized R-Mult shown in the Booked Trades.</p>
+      <p><b>Add</b> — scale into an existing position. Enter just Entry Date, Entry ₹ and Added Quantity; nothing else needs re-entering. The position's average Entry ₹ and total quantity recalculate automatically (weighted by size), its Position ID stays exactly the same, and a new line appears in the entry summary.</p>
+      <p><b>Exit</b> — scale out or close a position. You see the position's details for reference (read-only) and enter Exit ₹, Exit Quantity (defaults to the full open quantity) and optional Notes. Quantity is reduced <b>FIFO</b> — oldest entries are exited first, matching how exchanges actually account for it. Exit less than the full quantity and the remainder stays open with its entries updated; exit the full quantity and the position closes and disappears from this tab.</p>
+      <p>Either way, a <b>Booked Trades entry is created automatically</b> for exactly the quantity you exited — carrying the same Position ID as the position it came from, with its own realized Net P/L, R-Mult and Hold calculated from the FIFO-matched Entry ₹ and date. Its <b>Impact</b> is calculated fresh from your Current Capital at this exact moment, then locked in permanently. You never re-type Symbol, Strategy, Setup or Init SL to close a trade.</p>
       <h4>3. Booked Trades</h4>
-      <p>Every closed trade for the selected FY and Strategy — populated automatically as you exit Open Trades, plus anything you log directly here. Filter by Setup or side, search by symbol or Position ID. Click ✎ to edit a trade; Delete lives inside that edit dialog rather than on the row, so a stray tap can't remove a trade by accident. Trades that share a Position ID — every partial exit and the final exit from the same original position — are grouped together and shown in chronological order (with a label like "FY2627-0008 (exit 2/3)"), so you can review a position's whole lifecycle as one block, while the list overall still sorts newest-first. Manually logged trades that didn't come from an Open Trade simply won't have a Position ID. The <b>Hold</b> column is calculated automatically from Entry Date to Exit Date. <b>Impact</b> is always calculated once, at the exact moment a trade closes, as Net P/L ÷ Current Capital at that instant — how much that trade moved your capital. It's then locked in permanently: it never recalculates afterwards, so the Booked Trades stays a true historical record no matter how your account grows or shrinks later. <b>R-Mult</b> (Net P/L ÷ initial risk) needs an Init SL logged on the trade to show anything but "—". <b>P/L %</b> is Net P/L as a percentage of capital deployed on that trade. Both <b>Strategy</b> and <b>Setup</b> are fixed dropdowns (not free text), so they stay consistent across every trade — this is what makes Performance by Setup and the Strategy Filter trustworthy. Trades logged before Strategy existed show as <b>Not Assigned</b>, and trades logged before Impact existed had it reconstructed once automatically from your trade history, then locked in the same way. <b>Followed Plan</b> (Yes/No/Not set, available both in the Add/Edit Trade dialog and when exiting an Open Trade) records whether you actually stuck to your own criteria on that trade — it's stored as a small tag at the start of Notes rather than a separate field, and shows as its own line, <b>Plan: ✅</b> or <b>Plan: ❌</b>, above your manually typed note in the Notes column here.</p>
+      <p>Every closed trade for the selected FY and Strategy — populated automatically as you exit Open Trades, plus anything you log directly here. Filter by Setup or side, search by symbol or Position ID. Click ✎ to edit a trade; Delete lives inside that edit dialog rather than on the row, so a stray tap can't remove a trade by accident. Trades that share a Position ID — every partial exit and the final exit from the same original position — are grouped together and shown in chronological order (with a label like "FY2627-0008 (exit 2/3)"), so you can review a position's whole lifecycle as one block, while the list overall still sorts newest-first. Manually logged trades that didn't come from an Open Trade simply won't have a Position ID. The <b>Hold</b> column is calculated automatically from Entry Date to Exit Date. <b>Impact</b> is always calculated once, at the exact moment a trade closes, as Net P/L ÷ Current Capital at that instant — how much that trade moved your capital. It's then locked in permanently: it never recalculates afterwards, so the Booked Trades stays a true historical record no matter how your account grows or shrinks later. <b>R-Mult</b> (Net P/L ÷ initial risk) needs an Init SL logged on the trade to show anything but "—". <b>P/L %</b> is Net P/L as a percentage of capital deployed on that trade. Both <b>Strategy</b> and <b>Setup</b> are fixed dropdowns (not free text), so they stay consistent across every trade — this is what makes Performance by Setup and the Strategy Filter trustworthy. Trades logged before Strategy existed show as <b>Not Assigned</b>, and trades logged before Impact existed had it reconstructed once automatically from your trade history, then locked in the same way. <b>Followed Plan</b> (Yes/No/Not set, available both in the Add/Edit Trade dialog and when exiting an Open Trade) records whether you actually stuck to your own criteria on that trade — it's stored as a small tag at the start of Notes rather than a separate field, and shows as its own line, <b>Plan: ✅</b> or <b>Plan: ❌</b>, above your manually typed note in the Notes column here. At the top of the table, <b>Net Booked P/L</b> is your total realized P&amp;L after charges, shown next to the <b>Charges &amp; Tax</b> total that was deducted to reach it — both scoped to your current FY/Strategy filter. A trade's own <b>Net P/L</b>, <b>P/L %</b>, and <b>R-Mult</b> are already net of charges whenever a <b>Type</b> is set on it (carried over automatically from the Open Trade it came from, or picked directly when logging a trade here); a trade with no Type shows pure gross P/L, since there's nothing to calculate a charge from.</p>
       
       <h4>4. Money Management</h4>
-      <p><b>Position Calculator</b> — at the top of this tab, add a candidate with Entry Price and Stop Loss. Quantity auto-calculates so that a stop-out loses no more than your Risk % of current capital. Use the ↳ button to add the sized candidate directly to Open Trades.</p>
-      <p><b>Capital &amp; Risk</b> — shows <b>Current Capital</b> (labeled with a small "Capital Balance + Realized P/L" reference underneath — your ledger's Capital Balance plus this FY's Net P/L), <b>Capital in Use</b> (value tied up in Open Trades — never FY-filtered), <b>Available Capital</b> (Current Capital minus Capital in Use), and your <b>Risk per Trade (%)</b> and <b>Capital Protection (%)</b> settings. Risk % and Capital Protection % can only be edited while viewing the current FY; other Financial Years are read-only.</p>
+      <p><b>Position Calculator</b> — at the top of this tab, add a candidate with Entry ₹ and Stop Loss. Quantity auto-calculates so that a stop-out loses no more than your Risk % of current capital. Use the ↳ button to add the sized candidate directly to Open Trades.</p>
+      <p><b>Charges &amp; Tax</b> — set a simple round-trip % for each Type (Equity Intraday, Equity Delivery, Equity Future, Equity Option, Commodity Future, Commodity Option), applied to Turnover (Entry Value + Exit Value) on any Booked Trade that has that Type selected — a rough approximation of Zerodha's published rates (brokerage, STT, exchange charges, GST, SEBI charges, stamp duty), which you should fine-tune against your own contract notes. A separate flat <b>DP Charges (₹ per scrip)</b> field sits below it, applied on top only for Equity Delivery, since demat charges are a fixed fee per scrip rather than a % of trade size. These charges are deducted directly from Net P/L wherever it's calculated in the app — Booked Trades, the Dashboard (Win Rate, Avg R, Profit Factor, Equity Curve, Max Drawdown), and the Capital Ledger — so every number you see reflects your real after-cost result. A trade with no Type set is left untouched at its gross P/L, since there's nothing to base a charge on.</p>
+      <p><b>Capital &amp; Risk</b> — shows <b>Current Capital</b> (labeled with a small "Capital Balance + Net Booked P/L" reference underneath — your ledger's Capital Balance plus this FY's Net P/L), <b>Capital in Use</b> (value tied up in Open Trades — never FY-filtered), <b>Available Capital</b> (Current Capital minus Capital in Use), and your <b>Risk per Trade (%)</b> and <b>Capital Protection (%)</b> settings. Risk % and Capital Protection % can only be edited while viewing the current FY; other Financial Years are read-only.</p>
       <p><b>Capital Transactions</b> — a running ledger for the selected FY: Opening Balance, Deposits, Withdrawals, Adjustments, and the P&amp;L Transfer created when a Financial Year is closed. Each row shows a <b>Dr Amount</b> (money out) or a <b>Cr Amount</b> (money in) — never both — the same convention as a bank passbook. <b>Capital Balance</b> (shown in the section header) is the ledger's own running total; it excludes this FY's not-yet-transferred trade P&amp;L, which is why Current Capital above is Capital Balance + Net P/L (FY). Use <b>+ Add Transaction</b> (bottom-right of the table) to log a Deposit, Withdrawal, or Adjustment — only available for the current FY. Deposit is always Cr and Withdrawal is always Dr (locked automatically); Adjustment is the only type where you choose <b>Amount Type: Cr or Dr</b> yourself, since it's a manual correction that can go either way. Click ✎ on a row to edit or delete it — Deposits, Withdrawals, and Adjustments can be edited any time their FY is still the current one; the Opening Balance can only be edited if it belongs to the very first Financial Year on record and that FY hasn't been closed yet; the P&amp;L Transfer created by Close FY can never be edited, since it has to stay an exact record of what actually happened.</p>
-      <p><b>Close FY</b> — available only for the current Financial Year. It calculates that FY's Realized Net P/L, records a P/L Transfer and a new Opening Balance in the ledger, and opens the next Financial Year — all in one step, after two confirmation screens. It cannot be run twice for the same FY.</p>
+      <p><b>Close FY</b> — available only for the current Financial Year. It calculates that FY's Net Booked P/L, records a P/L Transfer and a new Opening Balance in the ledger, and opens the next Financial Year — all in one step, after two confirmation screens. It cannot be run twice for the same FY.</p>
       <h4>5. Configuration</h4>
       <p><b>Strategies</b> — add, rename, or remove the strategies that appear in the Strategy dropdown across Booked Trades and Open Trades, and in the Dashboard's Strategy Filter. Renaming updates every trade that already uses that strategy; removing one only takes it out of future selection.</p>
       <p><b>Setup</b> — same idea, for setups. Add, rename, or remove entries here and the Setup dropdown everywhere in the app updates automatically.</p>
@@ -1933,13 +2036,13 @@ function renderHowToTab(){
       <h4>Financial Year (FY) &amp; Strategy Filter</h4>
       <p>The FY dropdown (April–March) and the Strategy dropdown sit side by side in the top bar. Together they scope the Dashboard, Booked Trades, Performance by Setup, Monthly Performance, and Money Management. Besides individual years, the FY dropdown also has an <b>All Time</b> option, which shows those same views across every trade you've ever logged, regardless of year — it defaults to the current FY on open, not All Time. In <b>Money Management</b>, All Time is a true lifetime view: Current Capital is live, and Capital Transactions combines every FY's ledger chronologically (each FY's own Opening Balance row is left out there, since it's just a repeat of the balance already carried forward). <b>YTD Return %</b> always reflects the real current FY, even while browsing All Time or a past year — Return % is instead labeled <b>FY Return %</b> for a past year and <b>All Time Return %</b> when that's selected. Open Trades are never FY-filtered — they always show everything currently open. Pick <b>All Strategies</b> to see overall performance, or a specific strategy to see everything filtered to just that one — your underlying data isn't split up, only the view.</p>
       <h4>Export &amp; Import Data</h4>
-      <p>Use <b>Export Data</b> in Configuration → Data &amp; Backup to choose a <b>Report Type</b> (Open Trades, Booked Trades, or Capital Transactions) and a <b>Period</b> (Current FY, Previous FY, All Time, or a Custom Range), then download it as an .xlsx file.</p>
-      <p><b>Import Trades</b>, in the same place, bulk-imports closed trades from a broker export or another journal (CSV, .xlsx, or .xls). Pick a file — if it has more than one sheet, you'll be asked which one to use — then map its columns to TradeVault's fields (auto-guessed where possible — Symbol, Side, Entry/Exit Date, Entry/Exit Price, and Quantity are required; Init SL, Strategy, Setup, and Notes are optional). Dates should be <b>YYYY-MM-DD</b> or <b>DD-MM-YYYY</b>; other formats may not parse correctly. Side values like Buy/Sell or B/S are recognized automatically. A Strategy or Setup value that doesn't match one of your configured tags is left blank rather than silently creating a new one — add it in Configuration first if you want it recognized, then re-import. Rows that match an existing trade on Symbol + Entry/Exit Date + Entry/Exit Price + Qty are treated as duplicates and skipped by default (with an option to import them anyway, in case it's a genuinely repeated trade). Nothing is written until the final preview step, which shows every row's status and lets you confirm before committing — rows with errors (bad dates, missing prices, etc.) are skipped and listed individually so you can fix and re-import just those.</p>
+      <p>Use <b>Export Data</b> in Configuration → Data &amp; Backup to choose a <b>Report Type</b> (Open Trades, Booked Trades, or Capital Transactions) and a <b>Period</b> (Current FY, Previous FY, All Time, or a Custom Range), then download it as an .xlsx file. The Booked Trades export includes both <b>Gross P/L</b> and <b>Charges &amp; Tax</b> as separate columns alongside <b>Net P/L</b>, so you can audit exactly what was deducted rather than just trusting the final number.</p>
+      <p><b>Import Trades</b>, in the same place, bulk-imports closed trades from a broker export or another journal (CSV, .xlsx, or .xls). Pick a file — if it has more than one sheet, you'll be asked which one to use — then map its columns to TradeVault's fields (auto-guessed where possible — Symbol, Side, Entry/Exit Date, Entry/Exit ₹, and Quantity are required; Init SL, Strategy, Setup, and Notes are optional). Dates should be <b>YYYY-MM-DD</b> or <b>DD-MM-YYYY</b>; other formats may not parse correctly. Side values like Buy/Sell or B/S are recognized automatically. A Strategy or Setup value that doesn't match one of your configured tags is left blank rather than silently creating a new one — add it in Configuration first if you want it recognized, then re-import. Rows that match an existing trade on Symbol + Entry/Exit Date + Entry/Exit ₹ + Qty are treated as duplicates and skipped by default (with an option to import them anyway, in case it's a genuinely repeated trade). Nothing is written until the final preview step, which shows every row's status and lets you confirm before committing — rows with errors (bad dates, missing prices, etc.) are skipped and listed individually so you can fix and re-import just those.</p>
       <h4>Last Updated</h4>
       <p>The top bar shows a <b>Last Updated</b> timestamp, visible on every tab, that refreshes automatically whenever you add, edit, or delete a trade or open trade, or save changes in Money Management.</p>
       <h4>Data &amp; Backup</h4>
       <p>Everything you enter is saved automatically to a local database file on this computer as you use it, and reloads exactly as you left it next time — no login, no server, nothing shared with anyone else. The journal works fully offline (aside from Excel Export and initial font loading, which need an internet connection).</p>
-      <p><b>Configuration → Data &amp; Backup</b> shows exactly where that database file lives on your computer, and is split into two sections. <b>Export &amp; Import Data</b> acts on specific data — <b>Export Data</b> downloads a report and <b>Import Trades</b> bulk-loads trades from a file, both explained above. <b>Backup</b> is different — <b>Export Backup</b> saves a one-off snapshot of the entire app (every trade, position, setting, and Capital Transaction) whenever you want, and <b>Import Backup</b> restores from one, replacing all current data in the app — handy for a manual safety copy, or for moving your journal to a new computer.</p>
+      <p><b>Configuration → Data &amp; Backup</b> shows exactly where that database file lives on your computer, and is split into two sections. <b>Export &amp; Import Data</b> acts on specific data — <b>Export Data</b> downloads a report and <b>Import Trades</b> bulk-loads trades from a file, both explained above. <b>Backup</b> is different — <b>Export Backup</b> saves a one-off snapshot of the entire app (every trade, position, setting, and Capital Transaction) whenever you want, and <b>Import Backup</b> restores from one, replacing all current data in the app — handy for a manual safety copy, or for moving your journal to a new computer. A small note next to the Backup heading tracks when you last did this — green within 7 days, amber from 8–14, red past that or if you've never backed up at all — since this is real trading data on a single computer, and there's no automatic cloud copy.</p>
     </div>
   </div>`;
 }
@@ -1957,8 +2060,8 @@ const CSV_FIELD_DEFS = [
   { key:'side', label:'Side', required:true, aliases:['side','type','buy/sell','transaction type','trade type'] },
   { key:'entry', label:'Entry Date', required:true, aliases:['entry date','buy date','entry','trade date','date bought'] },
   { key:'exit', label:'Exit Date', required:true, aliases:['exit date','sell date','exit','date sold'] },
-  { key:'entryPrice', label:'Entry Price', required:true, aliases:['entry price','buy price','entry rate','avg buy price'] },
-  { key:'exitPrice', label:'Exit Price', required:true, aliases:['exit price','sell price','exit rate','avg sell price'] },
+  { key:'entryPrice', label:'Entry ₹', required:true, aliases:['entry price','buy price','entry rate','avg buy price'] },
+  { key:'exitPrice', label:'Exit ₹', required:true, aliases:['exit price','sell price','exit rate','avg sell price'] },
   { key:'qty', label:'Quantity', required:true, aliases:['qty','quantity','shares','units'] },
   { key:'initSL', label:'Init SL', required:false, aliases:['init sl','initial sl','stop loss','sl'] },
   { key:'strategy', label:'Strategy', required:false, aliases:['strategy'] },
@@ -2112,8 +2215,8 @@ function buildTradeFromCsvRow(row){
   if(!entry) errors.push('Unrecognized Entry Date');
   if(!exit) errors.push('Unrecognized Exit Date');
   if(entry && exit && exit<entry) errors.push('Exit Date is before Entry Date');
-  if(isNaN(entryPrice) || entryPrice<=0) errors.push('Invalid Entry Price');
-  if(isNaN(exitPrice) || exitPrice<=0) errors.push('Invalid Exit Price');
+  if(isNaN(entryPrice) || entryPrice<=0) errors.push('Invalid Entry ₹');
+  if(isNaN(exitPrice) || exitPrice<=0) errors.push('Invalid Exit ₹');
   if(isNaN(qty) || qty<=0) errors.push('Invalid Quantity');
   if(m.initSL && initSLraw!=='' && isNaN(initSL)) errors.push('Invalid Init SL');
 
@@ -2125,7 +2228,7 @@ function buildTradeFromCsvRow(row){
               ].filter(Boolean) };
 }
 
-// A trade is treated as a duplicate if Symbol + Entry Date + Exit Date + Qty + Entry Price + Exit
+// A trade is treated as a duplicate if Symbol + Entry Date + Exit Date + Qty + Entry ₹ + Exit
 // Price all match — matching against both trades already in the Booked Trades and earlier rows already
 // seen in this same import (so a file with the same line twice doesn't just import it twice).
 function tradeDupeKey(t){ return `${t.symbol}|${t.entry}|${t.exit}|${t.qty}|${t.entryPrice}|${t.exitPrice}`; }
@@ -2155,9 +2258,9 @@ function renderCsvPreviewStep(){
   document.getElementById('modalBody').innerHTML = `
     <h3>Preview Import</h3>
     <p class="desc"><span class="pos" style="font-weight:600">${clean.length} ready to import</span>${dupes.length?` · <span style="color:var(--muted);font-weight:600">${dupes.length} duplicate${dupes.length===1?'':'s'} skipped</span>`:''}${invalid.length?` · <span class="neg" style="font-weight:600">${invalid.length} will be skipped</span>`:''}${tagWarnings? ` · <span style="color:var(--muted)">${tagWarnings} Strategy/Setup value${tagWarnings>1?'s':''} left blank</span>` : ''}</p>
-    ${dupes.length? `<label style="display:flex;align-items:center;gap:8px;margin-top:10px;font-size:12.5px;color:var(--muted)"><input type="checkbox" id="includeDupes"> Import the ${dupes.length} duplicate${dupes.length===1?'':'s'} anyway (matched on Symbol + Entry/Exit Date + Entry/Exit Price + Qty — could be a genuinely repeated trade, not always a mistake)</label>` : ''}
+    ${dupes.length? `<label style="display:flex;align-items:center;gap:8px;margin-top:10px;font-size:12.5px;color:var(--muted)"><input type="checkbox" id="includeDupes"> Import the ${dupes.length} duplicate${dupes.length===1?'':'s'} anyway (matched on Symbol + Entry/Exit Date + Entry/Exit ₹ + Qty — could be a genuinely repeated trade, not always a mistake)</label>` : ''}
     <div class="table-scroll" style="max-height:320px;margin-top:12px"><table><thead><tr>
-      <th>Symbol</th><th>Side</th><th>Entry</th><th>Exit</th><th>Entry Price</th><th>Exit Price</th><th>Qty</th><th>Status</th>
+      <th>Symbol</th><th>Side</th><th>Entry</th><th>Exit</th><th>Entry ₹</th><th>Exit ₹</th><th>Qty</th><th>Status</th>
     </tr></thead><tbody>
     ${parsed.slice(0,50).map(p=>`<tr>
       <td>${p.rec.symbol||'—'}</td><td>${p.rec.side}</td><td>${p.rec.entry||'—'}</td><td>${p.rec.exit||'—'}</td>
@@ -2205,10 +2308,11 @@ function openTradeModal(id){
     <div class="form-grid">
       <div class="field"><label>Symbol</label><input id="mSymbol" value="${t?.symbol||''}"></div>
       <div class="field"><label>Side</label><select id="mSide"><option value="LONG" ${t?.side==='LONG'?'selected':''}>Long</option><option value="SHORT" ${t?.side==='SHORT'?'selected':''}>Short</option></select></div>
+      <div class="field"><label>Trade Type</label><select id="mTradeType">${tradeTypeOptions(t?.tradeType)}</select></div>
       <div class="field"><label>Entry Date</label><input type="date" id="mEntry" value="${t?.entry||''}"></div>
       <div class="field"><label>Exit Date</label><input type="date" id="mExit" value="${t?.exit||''}"></div>
-      <div class="field"><label>Entry Price</label><input type="number" step="any" id="mEntryPrice" value="${t?.entryPrice??''}"></div>
-      <div class="field"><label>Exit Price</label><input type="number" step="any" id="mExitPrice" value="${t?.exitPrice??''}"></div>
+      <div class="field"><label>Entry ₹</label><input type="number" step="any" id="mEntryPrice" value="${t?.entryPrice??''}"></div>
+      <div class="field"><label>Exit ₹</label><input type="number" step="any" id="mExitPrice" value="${t?.exitPrice??''}"></div>
       <div class="field"><label>Quantity</label><input type="number" step="any" id="mQty" value="${t?.qty??''}"></div>
       <div class="field"><label>Init SL</label><input type="number" step="any" id="mSL" value="${t?.initSL??''}"></div>
       <div class="field"><label>INIT SL %</label><input id="mIntRisk" disabled></div>
@@ -2242,7 +2346,7 @@ function openTradeModal(id){
     const followedVal = document.getElementById('mFollowedPlan').value;
     const followed = followedVal==='yes'?true:(followedVal==='no'?false:null);
     const rec = { id: t?t.id:uid(), posId: t?t.posId:null, symbol: document.getElementById('mSymbol').value.trim().toUpperCase(),
-      side: document.getElementById('mSide').value, entry: document.getElementById('mEntry').value,
+      side: document.getElementById('mSide').value, tradeType: document.getElementById('mTradeType').value||null, entry: document.getElementById('mEntry').value,
       exit: document.getElementById('mExit').value, entryPrice: parseFloat(document.getElementById('mEntryPrice').value),
       exitPrice: parseFloat(document.getElementById('mExitPrice').value), qty: parseFloat(document.getElementById('mQty').value),
       initSL: document.getElementById('mSL').value===''?null:parseFloat(document.getElementById('mSL').value),
@@ -2261,19 +2365,20 @@ function openOpenModal(id){
   const singleLot = t && (!t.lots || t.lots.length<=1);
   const entryFields = !t ? `
       <div class="field"><label>Entry Date</label><input type="date" id="mEntry" value="${new Date().toISOString().slice(0,10)}"></div>
-      <div class="field"><label>Entry Price</label><input type="number" step="any" id="mEntryPrice"></div>
+      <div class="field"><label>Entry ₹</label><input type="number" step="any" id="mEntryPrice"></div>
       <div class="field"><label>Quantity</label><input type="number" step="any" id="mQty"></div>` : singleLot ? `
       <div class="field"><label>Entry Date</label><input type="date" id="mEntry" value="${t.entry}"></div>
-      <div class="field"><label>Entry Price</label><input type="number" step="any" id="mEntryPrice" value="${t.entryPrice}"></div>
+      <div class="field"><label>Entry ₹</label><input type="number" step="any" id="mEntryPrice" value="${t.entryPrice}"></div>
       <div class="field"><label>Quantity</label><input type="number" step="any" id="mQty" value="${t.qty}"></div>` : `
       <div class="field"><label>Entry Date</label><input value="${fmtDate(t.entry)}" disabled></div>
-      <div class="field"><label>Entry Price (avg)</label><input id="mEntryPrice" value="${t.entryPrice.toFixed(2)}" disabled></div>
+      <div class="field"><label>Entry ₹ (avg)</label><input id="mEntryPrice" value="${t.entryPrice.toFixed(2)}" disabled></div>
       <div class="field"><label>Quantity (total)</label><input value="${t.qty}" disabled></div>`;
   document.getElementById('modalBody').innerHTML = `
     <h3>${t?'Edit':'Add'} Open Trade</h3>
     <div class="form-grid">
       <div class="field"><label>Symbol</label><input id="mSymbol" value="${t?.symbol||''}"></div>
       <div class="field"><label>Side</label><select id="mSide"><option value="LONG" ${t?.side==='LONG'?'selected':''}>Long</option><option value="SHORT" ${t?.side==='SHORT'?'selected':''}>Short</option></select></div>
+      <div class="field"><label>Trade Type</label><select id="mTradeType">${tradeTypeOptions(t?.tradeType)}</select></div>
       ${entryFields}
       <div class="field"><label>Init SL</label><input type="number" step="any" id="mSL" value="${t?.initSL??''}"></div>
       <div class="field"><label>INIT SL %</label><input id="mIntRisk" disabled></div>
@@ -2307,6 +2412,7 @@ function openOpenModal(id){
   document.getElementById('mSave').onclick = ()=>{
     const symbol = document.getElementById('mSymbol').value.trim().toUpperCase();
     const side = document.getElementById('mSide').value;
+    const tradeType = document.getElementById('mTradeType').value||null;
     const initSL = document.getElementById('mSL').value===''?null:parseFloat(document.getElementById('mSL').value);
     const trailedSL = document.getElementById('mTSL').value===''?null:parseFloat(document.getElementById('mTSL').value);
     const cmp = document.getElementById('mCmp').value===''?null:parseFloat(document.getElementById('mCmp').value);
@@ -2325,14 +2431,14 @@ function openOpenModal(id){
         else { t.lots = [{ id: uid(), date: newDate, price: newPrice, qty: newQty }]; }
         recomputeFromLots(t);
       }
-      Object.assign(t, { symbol, side, initSL, trailedSL, cmp, strategy, setup });
+      Object.assign(t, { symbol, side, tradeType, initSL, trailedSL, cmp, strategy, setup });
       persistOpen(); closeModal(); render();
     } else {
       const entry = document.getElementById('mEntry').value;
       const entryPrice = parseFloat(document.getElementById('mEntryPrice').value);
       const qty = parseFloat(document.getElementById('mQty').value);
       if(!entry || isNaN(entryPrice) || isNaN(qty) || qty<=0){ alert('Entry date, entry price and a positive quantity are required.'); return; }
-      const { merged } = mergeOrCreateOpenPosition({ symbol, side, date: entry, price: entryPrice, qty, initSL, trailedSL, cmp, strategy, setup });
+      const { merged } = mergeOrCreateOpenPosition({ symbol, side, date: entry, price: entryPrice, qty, initSL, trailedSL, cmp, strategy, setup, tradeType });
       if(merged) alert(`${symbol} was already open — added as a new entry to the existing position.`);
       persistOpen(); closeModal(); render();
     }
@@ -2349,13 +2455,13 @@ function openEditLotModal(posId, lotId){
     <h3>Edit Entry — ${t.symbol}</h3>
     <div class="form-grid">
       <div class="field"><label>Entry Date</label><input type="date" id="mLotDate" value="${lot.date}"></div>
-      <div class="field"><label>Entry Price</label><input type="number" step="any" id="mLotPrice" value="${lot.price}"></div>
+      <div class="field"><label>Entry ₹</label><input type="number" step="any" id="mLotPrice" value="${lot.price}"></div>
       <div class="field"><label>Quantity</label><input type="number" step="any" id="mLotQty" value="${lot.qty}"></div>
       <div class="field"><label>Init SL</label><input type="number" step="any" id="mLotSL" value="${lotSL??''}"></div>
       <div class="field"><label>INIT SL %</label><input id="mLotIntRisk" disabled></div>
       <div class="field full"><label>Notes</label><textarea id="mLotNotes">${lot.notes||''}</textarea></div>
     </div>
-    <p class="desc">Recalculates Average Entry Price, Total Quantity and Invested. Position ID and entry history stay unchanged.</p>
+    <p class="desc">Recalculates Average Entry ₹, Total Quantity and Invested. Position ID and entry history stay unchanged.</p>
     <div class="modal-actions">
       ${t.lots.length>1?'<button class="btn btn-danger" id="mDel">Delete</button>':''}
       <button class="btn" id="mCancel">Cancel</button>
@@ -2401,7 +2507,7 @@ function openAddLotModal(id){
     <h3>Add to ${t.symbol}</h3>
     <div class="form-grid">
       <div class="field"><label>Entry Date</label><input type="date" id="mLotDate" value="${new Date().toISOString().slice(0,10)}"></div>
-      <div class="field"><label>Entry Price</label><input type="number" step="any" id="mLotPrice"></div>
+      <div class="field"><label>Entry ₹</label><input type="number" step="any" id="mLotPrice"></div>
       <div class="field"><label>Added Quantity</label><input type="number" step="any" id="mLotQty"></div>
     </div>
     <p class="desc">Current: ${t.qty} @ ${t.entryPrice.toFixed(2)} avg. Strategy, Setup and Init SL stay as already set on this position.</p>
@@ -2433,14 +2539,15 @@ function openExitModal(id){
     <div class="form-grid">
       <div class="field"><label>Symbol</label><input value="${t.symbol}" disabled></div>
       <div class="field"><label>Side</label><input value="${t.side}" disabled></div>
+      <div class="field"><label>Trade Type</label><input value="${t.tradeType?`${t.tradeType} — ${tradeTypeLabel(t.tradeType)}`:'—'}" disabled></div>
       <div class="field"><label>Entry Date</label><input value="${fmtDate(t.entry)}" disabled></div>
-      <div class="field"><label>Average Entry Price</label><input value="${t.entryPrice.toFixed(2)}" disabled></div>
+      <div class="field"><label>Average Entry ₹</label><input value="${t.entryPrice.toFixed(2)}" disabled></div>
       <div class="field"><label>Current Open Quantity</label><input value="${t.qty}" disabled></div>
       <div class="field"><label>Strategy</label><input value="${t.strategy||'Not Assigned'}" disabled></div>
       <div class="field"><label>Setup</label><input value="${t.setup||'—'}" disabled></div>
       <div class="field"><label>Init SL</label><input value="${t.initSL!=null?(+t.initSL).toFixed(2):'—'}" disabled></div>
       <div class="field"><label>INIT SL %</label><input value="${initRiskPct!=null?fmtPct(initRiskPct):'—'}" disabled></div>
-      <div class="field"><label>Exit Price</label><input type="number" step="any" id="mExitPrice"></div>
+      <div class="field"><label>Exit ₹</label><input type="number" step="any" id="mExitPrice"></div>
       <div class="field"><label>Exit Quantity</label><input type="number" step="any" id="mExitQty" value="${t.qty}"></div>
       <div class="field"><label>Followed Plan</label><select id="mExitFollowedPlan">
         <option value="" selected>Not set</option>
@@ -2461,14 +2568,14 @@ function openExitModal(id){
     const followedVal = document.getElementById('mExitFollowedPlan').value;
     const followed = followedVal==='yes'?true:(followedVal==='no'?false:null);
     const remarks = buildRemarksWithPlan(followed, document.getElementById('mExitRemarks').value);
-    if(isNaN(exitPrice)){ alert('Exit Price is required.'); return; }
+    if(isNaN(exitPrice)){ alert('Exit ₹ is required.'); return; }
     if(isNaN(exitQty) || exitQty<=0){ alert('Exit Quantity must be greater than zero.'); return; }
     if(exitQty > t.qty){ alert('Exit Quantity cannot exceed the current open quantity.'); return; }
     const { consumed, remainingLots } = fifoConsume(t.lots, exitQty);
     const consumedQty = consumed.reduce((s,l)=>s+l.qty, 0);
     const consumedEntryPrice = consumedQty ? consumed.reduce((s,l)=>s+l.price*l.qty, 0)/consumedQty : t.entryPrice;
     const consumedEntryDate = consumed.length ? sortLotsAsc(consumed)[0].date : t.entry;
-    const closedTrade = { id: uid(), posId: t.posId, symbol: t.symbol, side: t.side, entry: consumedEntryDate,
+    const closedTrade = { id: uid(), posId: t.posId, symbol: t.symbol, side: t.side, tradeType: t.tradeType||null, entry: consumedEntryDate,
       exit: new Date().toISOString().slice(0,10), entryPrice: consumedEntryPrice, exitPrice, qty: exitQty,
       initSL: t.initSL, strategy: t.strategy, setup: t.setup, remarks,
       posPctAtClose: t.posPct ?? null };
