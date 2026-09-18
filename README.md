@@ -1,5 +1,17 @@
 # TradeVault — Desktop (Electron) Edition
 
+## What's new in this build
+
+- **Setup list updated** — `renderer/index.html`'s default Setup dropdown now matches your latest list: `V-C-P`, `C-&-H`, `H-&-S`, `EMAPB`, `HADOJI`, `MPAUSE`, `MBRUST`, `HTFLAG`, `PENANT`, `MACROS`. (This only affects brand-new installs with no saved data — your existing Setup list on disk is untouched.)
+- **Renamed labels**: `Avg (R)` → `Average (R)`; `CMP` → `LTP ₹` everywhere it appeared (column headers, the Open Trades modal, exports, the Refresh button, and the help tab).
+- **Renamed the underlying field too**, not just the label: `cmp` → `ltp` in the code and in your saved data. A one-time migration runs automatically the first time you open this build — it copies your existing `cmp` values over to `ltp` so none of your live prices are lost, then saves in the new format from then on.
+- **New: Allocation %** in the Open Trades header — shows your total Invested across every open position as a % of your live Current Capital, recalculated every time the screen renders (unlike POS %, which is frozen per-position at entry). Colored green under 60%, amber 60–90%, red above 90%.
+- **Fixed a misleading-zero bug**: `LTP ₹`, `Net P/L`, `P/L %` and `R-Mult` used to silently fall back to showing your entry price as if it were the live price whenever no live price had actually been fetched yet — making it look like P/L was genuinely `0` when it was really just missing data. They now show `—` until a position has a real LTP (via Refresh LTP or typed in manually), so a `0` you see going forward is a real zero.
+- **Refresh LTP is now honest about failures** — the "LTP ₹ as of …" timestamp in the header only updates when at least one symbol's price actually came back successfully, instead of stamping a time even when every fetch failed.
+
+**Reminder:** Refresh LTP only works when running as the actual installed/dev Electron app (`npm start` or the built `.exe`) — Yahoo Finance blocks the request with a CORS error if you ever open `renderer/index.html` directly in a browser instead.
+
+
 This is the desktop version of your trading journal. Same app, same features, same
 calculations as the HTML version — but it now runs as a real installed Windows program
 and saves your data to a proper SQLite database file on your computer instead of a
@@ -152,19 +164,14 @@ Whenever I (or you) make a change to the app:
   plain web server/static file host (`"provider": "generic"` with a URL) — let me
   know if you'd prefer that route and I'll reconfigure it.
 
-## Known limitation (minor, cosmetic)
+## Fonts & Excel export — offline status
 
-The app still loads its fonts (Google Fonts) and the Excel export library (SheetJS)
-from the internet on startup — same as the HTML version did. This means:
-- The app needs an internet connection the first time it loads visuals/fonts and
-  whenever you use the Excel export buttons.
-- Everything else (logging trades, editing positions, the dashboard, backups) works
-  fully offline.
-
-If you want the app to be 100% offline-capable later, this can be fixed by
-downloading those two libraries once and bundling them into the `renderer` folder
-instead of loading them from a CDN — a small follow-up task, not required to use
-the app today.
+`renderer/index.html` already references both of these as local files, not CDN links:
+```html
+<link rel="stylesheet" href="fonts.css">
+<script src="lib/xlsx.full.min.js"></script>
+```
+So as long as `renderer/fonts.css` and `renderer/lib/xlsx.full.min.js` actually exist alongside `index.html` (make sure both are present when copying the renderer folder around), the app should already be fully offline-capable — no internet needed on launch or for Excel export. If either file is missing, those two links will fail silently and you'll be back to needing a connection for that piece.
 
 ## Project structure
 
@@ -178,3 +185,5 @@ tradevault/
     └── index.html      — the entire app UI and logic (same as your HTML version,
                            with the storage layer swapped to talk to main.js)
 ```
+
+**Note:** this delivered package doesn't include a `build/icon.ico` file, since it wasn't part of what was shared for this update. `main.js` and `package.json` both reference `build/icon.ico` for the window/taskbar icon and the installer icon — drop your existing `build` folder (the one you already have locally, which "must not be deleted") into this project root before running `npm start` or `npm run build`, otherwise the window/installer icon will be missing.

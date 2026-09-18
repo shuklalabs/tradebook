@@ -137,7 +137,7 @@ ipcMain.handle('import-backup', async () => {
 
 ipcMain.handle('get-db-path', () => path.join(app.getPath('userData'), 'tradevault.db'));
 
-// ---- IPC: live/EOD price quote for Open Trades → CMP ----
+// ---- IPC: live/EOD price quote for Open Trades → LTP ----
 // Runs in the main process (Node), not the renderer, specifically because Yahoo's
 // endpoint doesn't send CORS headers — a fetch from inside the browser window would
 // be blocked. Node's own https module has no such restriction.
