@@ -5,13 +5,13 @@ const https = require('https');
 const Database = require('better-sqlite3');
 const { autoUpdater } = require('electron-updater');
 
-app.setName('TradeVault'); // controls the userData folder name (%APPDATA%\TradeVault) — must be set before app.whenReady()
+app.setName('TradeBook'); // controls the userData folder name (%APPDATA%\TradeBook) — must be set before app.whenReady()
 
 let db;
 let mainWindow;
 
 function initDb(){
-  const dbPath = path.join(app.getPath('userData'), 'tradevault.db');
+  const dbPath = path.join(app.getPath('userData'), 'tradebook.db');
   db = new Database(dbPath);
   db.pragma('journal_mode = WAL'); // crash-safe writes — the whole reason we moved off a single JSON file
   db.exec(`CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
@@ -77,7 +77,7 @@ function setupAutoUpdater(){
     dialog.showMessageBox(mainWindow, {
       type: 'info',
       title: 'Update Ready',
-      message: `TradeVault ${info.version} has been downloaded.`,
+      message: `TradeBook ${info.version} has been downloaded.`,
       detail: 'Restart now to install it, or it will install automatically the next time you close the app.',
       buttons: ['Restart Now', 'Later'],
       defaultId: 0,
@@ -112,7 +112,7 @@ ipcMain.handle('kv-has', (event, key) => kvGet(key) !== null);
 ipcMain.handle('export-backup', async (event, jsonString) => {
   const { canceled, filePath } = await dialog.showSaveDialog(mainWindow, {
     title: 'Export Backup',
-    defaultPath: `TradeVault-Backup-${new Date().toISOString().slice(0,10)}.json`,
+    defaultPath: `TradeBook-Backup-${new Date().toISOString().slice(0,10)}.json`,
     filters: [{ name: 'JSON Backup', extensions: ['json'] }]
   });
   if (canceled || !filePath) return { ok: false };
@@ -135,7 +135,7 @@ ipcMain.handle('import-backup', async () => {
   }
 });
 
-ipcMain.handle('get-db-path', () => path.join(app.getPath('userData'), 'tradevault.db'));
+ipcMain.handle('get-db-path', () => path.join(app.getPath('userData'), 'tradebook.db'));
 
 // ---- IPC: live/EOD price quote for Open Trades → LTP ----
 // Runs in the main process (Node), not the renderer, specifically because Yahoo's

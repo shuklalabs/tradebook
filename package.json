@@ -1,9 +1,9 @@
 {
-  "name": "tradevault",
-  "version": "2.2.5",
-  "description": "TradeVault - Journal. Analyze. Improve.",
+  "name": "tradebook",
+  "version": "2.2.6",
+  "description": "TradeBook - Journal. Analyze. Improve.",
   "main": "main.js",
-  "author": "Ashish Labs",
+  "author": "Ashish Shukla",
   "license": "ISC",
   "private": true,
   "scripts": {
@@ -22,8 +22,8 @@
     "electron-updater": "^6.2.1"
   },
   "build": {
-    "appId": "com.aks.tradevault",
-    "productName": "TradeVault",
+    "appId": "com.aks.tradebook",
+    "productName": "TradeBook",
     "directories": {
       "output": "dist"
     },
@@ -46,8 +46,8 @@
     },
     "publish": {
       "provider": "github",
-      "owner": "akshukla-ai",
-      "repo": "tradevault"
+      "owner": "shuklalabs",
+      "repo": "tradebook"
     }
   }
 }

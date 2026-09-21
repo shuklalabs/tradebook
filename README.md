@@ -1,6 +1,8 @@
-# TradeVault — Desktop (Electron) Edition
+# TradeBook — Desktop (Electron) Edition
 
 ## What's new in this build
+
+- **App renamed: TradeVault → TradeBook.** New window title, in-app logo, npm package name, `appId` (`com.aks.tradebook`), backup/export filename prefixes, and the SQLite database filename (`tradebook.db`). See the migration section below — this changes where Windows stores your data, so a one-time backup/restore is needed.
 
 - **Setup list updated** — `renderer/index.html`'s default Setup dropdown now matches your latest list: `V-C-P`, `C-&-H`, `H-&-S`, `EMAPB`, `HADOJI`, `MPAUSE`, `MBRUST`, `HTFLAG`, `PENANT`, `MACROS`. (This only affects brand-new installs with no saved data — your existing Setup list on disk is untouched.)
 - **Renamed labels**: `Avg (R)` → `Average (R)`; `CMP` → `LTP ₹` everywhere it appeared (column headers, the Open Trades modal, exports, the Refresh button, and the help tab).
@@ -17,28 +19,38 @@ calculations as the HTML version — but it now runs as a real installed Windows
 and saves your data to a proper SQLite database file on your computer instead of a
 browser.
 
-## ⚠️ Important if you already tested a previous version
+## ⚠️ Important — this update renames the app (TradeVault → TradeBook)
 
-This update renames the app from "AKS Trade Journal" to "TradeVault," which changes
-where Windows stores its data — from `%APPDATA%\aks-trade-journal\` to
-`%APPDATA%\TradeVault\`. If you already logged real or test trades in the app
-before this rename, **they won't automatically appear** after this update, because
-the app now reads from a different folder.
+This changes where Windows stores your data — from `%APPDATA%\TradeVault\` to
+`%APPDATA%\TradeBook\` — because `app.setName()` controls that folder, and it's
+now set to `TradeBook`. If you already logged real or test trades under
+TradeVault, **they won't automatically appear** after this update, since the app
+now reads from a different folder and a differently-named database file
+(`tradevault.db` → `tradebook.db`).
 
-**Before running this updated version, export a backup from your old one:**
-1. Open your current running app → Configuration → Data & Backup → **Export Backup**
+**Before running this updated version, export a backup from your current TradeVault install:**
+1. Open your current running TradeVault app → Configuration → Data & Backup → **Export Backup**
 2. Save that `.json` file somewhere you'll find it
-3. Then run this updated version (`npm start` or the new installer)
+3. Then run this updated version (`npm start`, or install the new `.exe` once built)
 4. Once it opens, go to Configuration → Data & Backup → **Import Backup** and
    select that file — all your trades come back exactly as they were
 
 This is a one-time step caused specifically by this rename; it won't happen again
 for future updates.
 
+**Also worth knowing:** because `productName` and `appId` both changed, Windows
+will treat this as a separate program from your existing TradeVault install —
+it'll get its own entry in Program Files and the Start Menu rather than updating
+the old one in place, and your existing TradeVault install won't auto-update into
+this new name (auto-update only follows version bumps within the *same* app
+identity). Once you're happy with TradeBook, you'll likely want to manually
+uninstall the old TradeVault program from Windows so you're not running two
+copies side by side.
+
 ## What changed vs the HTML version
 
 - **Storage**: was browser localStorage → is now a SQLite database file at
-  `%APPDATA%\TradeVault\tradevault.db` (Windows). SQLite uses
+  `%APPDATA%\TradeBook\tradebook.db` (Windows). SQLite uses
   write-ahead logging (WAL mode), which is specifically designed to survive crashes
   and power loss mid-write without corrupting your data — a real upgrade over a
   single JSON blob.
@@ -90,7 +102,7 @@ npm run build
 ```
 
 This produces a Windows installer inside the `dist` folder (something like
-`TradeVault Setup 1.0.0.exe`). Run that installer like any normal
+`TradeBook Setup 2.2.4.exe`). Run that installer like any normal
 downloaded program — it installs to Program Files, adds a Start Menu entry and
 desktop shortcut, and from then on you launch it just like any other app.
 
@@ -113,7 +125,7 @@ for new versions (no server to run or pay for).
 
 1. **Create a GitHub account** if you don't have one (free) at github.com.
 2. **Create a new repository** for this app — it can be **private**, that's fine,
-   auto-update works the same either way. Name it anything, e.g. `aks-trade-journal`.
+   auto-update works the same either way. Name it anything, e.g. `tradebook`.
 3. Open `package.json` in this project and find this section near the bottom:
    ```json
    "publish": {
@@ -164,6 +176,15 @@ Whenever I (or you) make a change to the app:
   plain web server/static file host (`"provider": "generic"` with a URL) — let me
   know if you'd prefer that route and I'll reconfigure it.
 
+### GitHub fully renamed: akshukla-ai/tradevault → shuklalabs/tradebook
+
+`package.json`'s `build.publish` now points at `shuklalabs/tradebook`,
+matching both your renamed account and renamed repo. GitHub redirects the old
+`akshukla-ai/tradevault` URLs automatically, and your local `git remote`
+should keep working without any reconfiguration on your end — though it's
+worth double-checking with `git remote -v` that it's still resolving
+correctly the next time you push.
+
 ## Fonts & Excel export — offline status
 
 `renderer/index.html` already references both of these as local files, not CDN links:
@@ -176,7 +197,7 @@ So as long as `renderer/fonts.css` and `renderer/lib/xlsx.full.min.js` actually 
 ## Project structure
 
 ```
-tradevault/
+tradebook/
 ├── main.js          — Electron's main process: creates the window, runs the
 │                       SQLite database, handles backup file dialogs
 ├── preload.js        — the narrow, secure bridge between the app's UI and main.js
